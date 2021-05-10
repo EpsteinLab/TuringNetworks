@@ -34,9 +34,39 @@ classdef NetSim
     
     properties %(SetAccess = private)
         timestamp
-        x1Long
+        
+        x1Long %Group for long time arrays
         x2Long
         tLong
+        dx1dt_long
+        dx2dt_long
+        
+        jac_funcs %Group for Jacobian functions
+        j_existArray %For each element of the Jacobian (same row and column)
+            %This array will store a logical true if that x is in the
+            %funtion. For example, if the (1, 2) element of the Jacobain
+            %(df1(x1, x2) / dx2) = x2^2, the (1, 2, 2) element of this
+            %array would be true and the (1, 2, 1) element would be false.
+        
+        jDerivs %Group for time derivative of jacobian functions
+        jderiv_existArray %Same sort of existArray as above, but this time
+            %instead of just the first slice being x1 and the second being
+            %x2, there will be four slices in the order of :
+            %dx1dt, dx2dt, x1, x2. Note this doesn't hold for more than a 2
+            %variable system now - doing this in 3 variables will take a
+            %lot of rewriting
+            
+        det_func %anonymous determinant of the jacobian
+        tr_func
+        det_var  %variables in the determinant function (1x2 logical arry)
+        tr_var
+        
+        mu_dot  %Growth function derivative
+        mu_dot_var  %Does the growth function derivative require t variable?
+        mu_dotdot  %Growth function second derivative
+        mu_dotdot_var  %Does this require t variable input?
+        rhok_dot  %Derivative of rhok in time
+        rhok_dot_tVar %Do you need to plug in time to rhok_dot (or just k)?
     end
     
     methods   %Constructor and Destructor
@@ -114,7 +144,7 @@ classdef NetSim
         end
         
         function func = get.rhok(obj)
-            func = @(t,k)(pi()^2 * k^2)/(obj.grow_func(t))^2;
+            func = @(t,k)(pi()^2 * k.^2)/(obj.grow_func(t))^2;
         end
         
         function func = get.grow_ode(obj)
@@ -191,6 +221,472 @@ classdef NetSim
             for i = 1:obj.num_var
                 fxns{i} = obj.rxn_funcs{i}(X,K);
             end
+        end
+    end
+    
+    methods   %Methods to set functions (for optimization)
+        
+        function obj = presetAll(obj)
+            %This function should preset all of the equations, derivatives,
+            %and variables necessary to completely eliminate any symbolic
+            %evaluation during actual simulations
+            
+            [obj.jac_funcs, obj.j_existArray] = obj.setJacFuncs();
+            [obj.jDerivs, obj.jderiv_existArray] = obj.setJacDerivFuncs();
+            [obj.det_func, obj.det_var] = obj.makeDetFunc();
+            [obj.tr_func, obj.tr_var] = obj.makeTrFunc();
+            [obj.mu_dot, obj.mu_dot_var, obj.mu_dotdot, obj.mu_dotdot_var] ...
+                = obj.setGrowDerivs();
+            [obj.rhok_dot, obj.rhok_dot_tVar] = obj.set_ddt_rhok();
+            obj.dx1dt_long = obj.numericalDeriv(obj.x1Long, obj.tLong);
+            obj.dx2dt_long = obj.numericalDeriv(obj.x2Long, obj.tLong);
+        end
+        
+        function [x1t, x2t] = valAtTime(obj, time)
+            % Gets interpolated x value at whatever time
+            [~, idx] = min(abs(obj.tLong - time));
+            x1t = obj.x1Long(idx);
+            x2t = obj.x2Long(idx);
+        end
+        
+        function [fxnArray, existArray] = setJacFuncs(obj)
+            %This function sets up an array of anonymous functions such
+            %that we can use the Jacobian elements really quickly, instead
+            %of constantly calling simulated stuff, which takes a long
+            %time.
+            %Also will set logical array to see which variables are used
+            jac = obj.rxn_jac;
+            [r, c] = size(jac);
+            fxnArray = cell(r,c);
+            existArray = zeros(r,c,2,'logical');
+            syms x1 x2
+            
+            for i = 1:r
+                for j = 1:c
+                    inside = symvar(jac(i,j));
+                    fxnArray{i,j} = matlabFunction(jac(i,j));
+                    if ismember(x1, inside)
+                        existArray(i,j,1) = true;
+                    else 
+                        existArray(i,j,1) = false;
+                    end
+                    if ismember(x2, inside)
+                        existArray(i,j,2) = true;
+                    else
+                        existArray(i,j,2) = false;
+                    end                    
+                end
+            end
+        end
+        
+        function val = callJac(obj, loc, x1val, x2val)
+            %This is a helper function that calls the evaluation of an
+            %element in the Jacobian. loc must be the [r, c] vector
+            %corresponding to the location in the jacobian and x1val and
+            %x2val should either be scalars or vectors of variable values
+            %(will hopefully be vectors so I can vectorize code)
+            r = loc(1);
+            c = loc(2);
+            f = obj.jac_funcs{r,c};
+            
+            if obj.j_existArray(r,c,1) && obj.j_existArray(r,c,2)                
+                val = f(x1val, x2val);
+            elseif obj.j_existArray(r,c,1) && ~obj.j_existArray(r,c,2)
+                val = f(x1val);
+            elseif ~obj.j_existArray(r,c,1) && obj.j_existArray(r,c,2)
+                val = f(x2val);
+            else
+                val = f();
+            end
+        end
+        
+        function [fxnArray, deriv_existArray] = setJacDerivFuncs(obj)
+            %This function sets up an array of anonymous functions so we
+            %can use the time derivatives of the Jacobians really easily
+            %instead of using symbols each time, which will take a while
+            %for sure.
+            jac = obj.rxn_jac;
+            [r, c] = size(jac);
+            fxnArray = cell(r,c);
+            deriv_existArray = zeros(r, c, 4, 'logical');
+            syms x1 x2 dx1dt dx2dt
+            
+            for i = 1:r
+                for j = 1:c
+                    dJx1 = diff(jac(i,j),x1);
+                    dJx2 = diff(jac(i,j),x2);
+                    dJdt_sym = dJx1 * dx1dt + dJx2 * dx2dt;
+                    inside = symvar(dJdt_sym);
+                    
+                    if ismember(dx1dt, inside)
+                        deriv_existArray(i, j, 1) = true;
+                    end
+                    if ismember(dx2dt, inside)
+                        deriv_existArray(i, j, 2) = true;
+                    end
+                    if ismember(x1, inside)
+                        deriv_existArray(i, j, 3) = true;
+                    end
+                    if ismember(x2, inside)
+                        deriv_existArray(i, j, 4) = true;
+                    end
+                    
+                    fxnArray{i,j} = matlabFunction(dJdt_sym);
+                end
+            end          
+        end
+        
+        function val = callJacDeriv(obj, loc, dx1dt, dx2dt, x1, x2)
+            %This is the same as the callJac function above, just for the
+            %jacobian derivative. So, there will be a lot more if-end
+            %statements, since we're dealing with 2^4 instead of 2^2
+            %variables
+            r = loc(1);
+            c = loc(2);
+            f = obj.jDerivs{r,c};
+            vect = obj.jderiv_existArray(r, c, :);
+            summ = sum(vect);
+            
+            if summ == 4
+                val = f(dx1dt, dx2dt, x1, x2);
+            elseif summ == 3
+                if ~vect(1)
+                    val = f(dx2dt, x1, x2);
+                elseif ~vect(2)
+                    val = f(dx1dt, x1, x2);
+                elseif ~vect(3)
+                    val = f(dx1dt, dx2dt, x2);
+                else
+                    val = f(dx1dt, dx2dt, x1);
+                end
+            elseif summ == 2
+                if vect(1)
+                    if vect(2)
+                        val = f(dx1dt, dx2dt);
+                    elseif vect(3)
+                        val = f(dx1dt, x1);
+                    elseif vect(4)
+                        val = f(dx1dt, x2);
+                    end
+                elseif vect(2)
+                    if vect(3)
+                        val = f(dx2dt, x1);
+                    elseif vect(4)
+                        val = f(dx2dt, x2);
+                    end
+                else
+                    val = f(x1, x2);
+                end
+            elseif summ == 1
+                if vect(1)
+                    val = f(dx1dt);
+                elseif vect(2)
+                    val = f(dx2dt);
+                elseif vect(3)
+                    val = f(x1);
+                else
+                    val = f(x2);
+                end
+            elseif summ == 0
+                val = f();
+            end
+        end
+        
+        function [func, vars] = makeDetFunc(obj)
+            syms x1 x2
+            det_v = det(obj.rxn_jac);
+            func = matlabFunction(det_v);
+            vars = zeros(1,2,'logical');
+            
+            if ismember(x1, symvar(det_v))
+                vars(1,1) = true;
+            end
+            if ismember(x2, symvar(det_v))
+                vars(1,2) = true;
+            end
+        end
+        
+        function val = callDet(obj, x1, x2)
+            %This calls the Det function
+            summ = sum(obj.det_var);
+            if summ == 2
+                val = obj.det_func(x1, x2);
+            elseif summ == 0
+                val = obj.det_func();
+            else
+                if obj.det_var(1)
+                    val = obj.det_func(x1);
+                else
+                    val = obj.det_func(x2);
+                end
+            end
+        end
+        
+        function [func, vars] = makeTrFunc(obj)
+            syms x1 x2
+            tr_v = trace(obj.rxn_jac);
+            func = matlabFunction(tr_v);
+            vars = zeros(1,2,'logical');
+            
+            if ismember(x1, symvar(tr_v))
+                vars(1,1) = true;
+            end
+            if ismember(x2, symvar(tr_v))
+                vars(1,2) = true;
+            end
+        end
+        
+        function val = callTrFunc(obj, x1, x2)
+            summ = sum(obj.tr_var);
+            if summ == 2
+                val = obj.tr_func(x1, x2);
+            elseif summ == 0
+                val = obj.tr_func();
+            else
+                if obj.tr_var(1)
+                    val = obj.tr_func(x1);
+                else
+                    val = obj.tr_func(x2);
+                end
+            end
+        end
+        
+        function [mudot, mudotV, mudotdot, mudotdotV] = setGrowDerivs(obj)
+            %This function sets all of the growth derivatives and whether
+            %they require a time input (true) or are
+            %time-independent (false)
+            syms t
+            gf_sym = obj.grow_func(t);
+            
+            md_sym = diff(gf_sym, t);
+            mudot = matlabFunction(md_sym);
+            if ismember(t, symvar(md_sym))
+                mudotV = true;
+            else
+                mudotV = false;
+            end
+            
+            mdd_sym = diff(md_sym, t);
+            mudotdot = matlabFunction(mdd_sym);
+            if ismember(t, symvar(mdd_sym))
+                mudotdotV = true;
+            else
+                mudotdotV = false;
+            end
+        end            
+        
+        function [d_rhok, d_rhok_var] = set_ddt_rhok(obj)
+            %This function sets the anonymous function for the time
+            %derivative of rhok and a variable to see if you need to plug
+            %in the time component into the growth function
+            syms t w
+            symfunc = obj.rhok(t,w);
+            d_rhok_sym = diff(symfunc, t);
+            d_rhok = matlabFunction(d_rhok_sym);
+            
+            if ismember(t, symvar(d_rhok_sym))
+                d_rhok_var = true;
+            else
+                d_rhok_var = false;
+            end            
+        end
+        
+        function val = callRhokDot(obj, time, wavenum)
+            %This function automatically calls the evaluatable rhok_deriv
+            %function with the appropriate inputs
+            if obj.rhok_dot_tVar
+                val = obj.rhok_dot(time,wavenum);
+            else
+                val = obj.rhok_dot(wavenum);
+            end
+        end
+        
+        function lhsVal = lhsVG3_new(obj, dVal, time, wavenum)
+            %Outputs value for the left-hand side of Van Gorder's Theorem 3
+            %Note: assuming d1 = 1 and dVal = d2/d1
+            %
+            %Also Note: This is hopefully going to do the same thing as the
+            %previous lhsVG3 function, just in a different, hopefully
+            %faster manner. I removed all of the symbols from any repeated
+            %functions, so that should speed it up.
+            
+            %First, pull the actual values of the variables
+            [~, idx] = min(abs(obj.tLong - time));
+            x1val = obj.x1Long(idx);
+            x2val = obj.x2Long(idx);
+            
+            %Then, plug stuff in
+            lhsVal = obj.callDet(x1val, x2val) - ...
+                (dVal * obj.callJac([1 1], x1val, x2val) + ...
+                obj.callJac([2 2], x1val, x2val)) * obj.rhok(time, wavenum)...
+                + dVal * (obj.rhok(time, wavenum)).^2;
+        end
+        
+        function rhsVal1 = rhs1_new(obj, dVal, time, wavenum)
+            %This will return the value of the first part of the right-hand
+            %side of Van Gorder's Theorem 3 (without the max term).
+            %
+            %This new version will just look at the functions, and not
+            %require anything symbolic (that was done before this point)
+            
+            %First, pull the actual values of the variables
+            [~, idx] = min(abs(obj.tLong - time));
+            x1val = obj.x1Long(idx);
+            x2val = obj.x2Long(idx);
+                        
+            %Set term 1
+            if obj.mu_dotdot_var %if t is input in mu_dotdot
+                term1 = -1*(obj.mu_dotdot(time) / obj.grow_func(time));
+            else
+                term1 = -1*(obj.mu_dotdot() / obj.grow_func(time));
+            end
+            
+            %Set first part of term two
+            if obj.mu_dot_var %if t is variable in mu_dot
+                term2_a = -1*(obj.mu_dot(time) / obj.grow_func(time));
+            else
+                term2_a = -1*(obj.mu_dot() / obj.grow_func(time));
+            end
+            
+            %Set second part of term three
+            term2_b = (1 + dVal)*obj.rhok(time, wavenum) - ...
+                obj.callTrFunc(x1val, x2val);
+            
+            %Put together
+            rhsVal1 = term1 + term2_a * term2_b;
+        end
+        
+        function poss1Val = possMaxA_new(obj, ~, time, wavenum)
+            %The first possible max value for Van Gorder's Theorem 3 rhs
+            %term.
+            %
+            %Note: this new version doesn't do anything with symbolic
+            %functions, since they are what's slowing down evaluation I
+            %think
+            
+            %First, figure out time
+            [~, idx] = min(abs(obj.tLong - time));
+            x1val = obj.x1Long(idx);
+            x2val = obj.x2Long(idx);
+            dx1val = obj.dx1dt_long(idx);
+            dx2val = obj.dx2dt_long(idx);
+            
+            %Then, do the first term
+            if obj.mu_dot_var
+                term1 = (obj.mu_dot(time)/obj.grow_func(time)) * ...
+                    (obj.callJacDeriv([1 2], dx1val, dx2val, x1val, x2val) ...
+                    / obj.callJac([1 2], x1val, x2val));
+            else
+                term1 = (obj.mu_dot()/obj.grow_func(time)) * ...
+                    (obj.callJacDeriv([1 2], dx1val, dx2val, x1val, x2val) ...
+                    / obj.callJac([1 2], x1val, x2val));
+            end
+            
+            %Calculate d/dt part via quotient rule
+            ddt = (obj.callJac([1 2], x1val, x2val) * (obj.callRhokDot(time, wavenum)...
+                - obj.callJacDeriv([1 1], dx1val, dx2val, x1val, x2val))...
+                - (obj.rhok(time, wavenum) - obj.callJac([1 1], x1val, x2val)) ...
+                * obj.callJacDeriv([1 2], dx1val, dx2val, x1val, x2val)) ...
+                / (obj.callJac([1 2], x1val, x2val))^2;
+            %ddt =(j12*(obj.anonDeriv(obj.rhok,t) - obj.jacDeriv(j11, time))...
+                %- (obj.rhok(t,k) - j11)*obj.jacDeriv(j12, time)) / j12^2;
+                
+            %Now, put it all together
+            poss1Val = term1 - obj.callJac([1 2],x1val,x2val) * ddt;
+        end
+        
+        function poss2Val = possMaxB_new(obj, dVal, time, wavenum)
+            %The second possible max value for Van Gorder's Theorem 3 rhs
+            %term.
+            %
+            %Note: this new version doesn't do anything with symbolic
+            %functions, since they are what's slowing down evaluation I
+            %think
+            
+            %First, figure out time
+            [~, idx] = min(abs(obj.tLong - time));
+            x1val = obj.x1Long(idx);
+            x2val = obj.x2Long(idx);
+            dx1val = obj.dx1dt_long(idx);
+            dx2val = obj.dx2dt_long(idx);
+            
+            %Then, do the first term
+            if obj.mu_dot_var
+                term1 = (obj.mu_dot(time)/obj.grow_func(time)) * ...
+                    (obj.callJacDeriv([2 1], dx1val, dx2val, x1val, x2val) ...
+                    / obj.callJac([2 1], x1val, x2val));
+            else
+                term1 = (obj.mu_dot()/obj.grow_func(time)) * ...
+                    (obj.callJacDeriv([2 1], dx1val, dx2val, x1val, x2val) ...
+                    / obj.callJac([2 1], x1val, x2val));
+            end
+            
+            %Next, figure out the ddt stuff
+            ddt = (obj.callJac([2 1], x1val, x2val) * ...
+                (dVal * obj.callRhokDot(time, wavenum) - ...
+                obj.callJacDeriv([2 2],dx1val, dx2val, x1val, x2val)) - ...
+                (dVal*obj.rhok(time, wavenum) - obj.callJac([2 2],x1val,x2val))...
+                * obj.callJacDeriv([2 1], dx1val, dx2val, x1val, x2val))...
+                / (obj.callJac([2 1], x1val, x2val)^2);
+            
+            %Finally, put it together properly
+            poss2Val = term1 - obj.callJac([2 1], x1val, x2val) * ddt;
+        end
+        
+        function rhsVal = rhsVG3_new(obj, dVal, time, wavenum)
+            %This function calculates the right-hand side of Van Gorder's
+            %Theorem 3 expression
+            %
+            %New method doesn't use symbolic anything
+            pt1 = obj.rhs1_new(dVal, time, wavenum);
+            
+            aaa = obj.possMaxA_new(dVal, time, wavenum);
+            bbb = obj.possMaxB_new(dVal, time, wavenum);
+            
+            rhsVal = pt1 + max(aaa, bbb);
+        end
+        
+        function logicalImg = findTuringSpace_new(obj, dVal)
+            %This function actually does the analysis using Van Gorder's
+            %Theorem 3, and outputs the results for one set of conditions
+            %as a logical array (can then become an image)
+            %
+            %The new version pre-defines all functions so we don't have to
+            %do anything symbolically during run-time; only at the
+            %beginning.
+            
+            %First, create long time and concentration arrays
+            t_vec = obj.homo_state{1,1};
+            conc_vec = obj.homo_state{1,2};
+            x1_vec = conc_vec(:,1);
+            x2_vec = conc_vec(:,2);
+            
+            [obj.tLong, obj.x1Long, obj.x2Long] = ...
+                obj.longTimeSeries(t_vec, x1_vec, t_vec, x2_vec, 500);
+            
+            %New step: pre-set all of the functions
+            obj = obj.presetAll();
+                        
+            %Next, create the wavenumber array I'll be looking through. At
+            %least to start with, will need to look at k from 0.1 to 80 in
+            %increments of 0.2 as default (though can set ahead of time
+            %too)
+            if isempty(obj.k_vec) 
+                obj.k_vec = 0.1:0.2:80.1;
+            end
+            
+            %Then, create a logical array and propagate with whether
+            %Theorem 3 holds.
+            logicalImg = zeros(length(obj.k_vec),length(obj.tLong),'logical');
+            
+            for i = 1:length(obj.tLong)
+                time = obj.tLong(i);
+                lhs = obj.lhsVG3_new(dVal, time, obj.k_vec);
+                rhs = obj.rhsVG3_new(dVal, time, obj.k_vec);
+                logicalImg(:,i) = (lhs < rhs);
+            end
+            
+            logicalImg = ~flipud(logicalImg); %to align/color it same as VG
         end
     end
     
@@ -607,8 +1103,27 @@ classdef NetSim
                 x1l = interp1(t1, x1, tl, 'linear');
                 x2l = interp1(t2, x2, tl, 'linear');
             end
-        end   
+        end
         
+        function derivVal = numericalDeriv(xlong, tlong)
+            %This function solves the numerical time derivative of xlong
+            %and tlong. Note: xlong and tlong must be vectors of the same
+            %length.
+            l = length(xlong);
+            derivVal = zeros(1,l);
+            
+            %first and last values
+            derivVal(1) = (xlong(2) - xlong(1)) / (tlong(2) - tlong(1));
+            derivVal(l) = (xlong(l) - xlong(l-1)) / (tlong(l) - tlong(l-1));
+            
+            %middle values
+            for i = 2:l-1
+                left = (xlong(i) - xlong(i-1)) / (tlong(i) - tlong(i-1));
+                right = (xlong(i+1) - xlong(i)) / (tlong(i+1) - tlong(i));
+                derivVal(i) = (left + right)/2;
+            end
+        end
+            
         function TF = similarTimeSeries(t1, x1, t2, x2, varargin)
             %This function determines whether two time series data points
             %are similar (true) or not (false).
